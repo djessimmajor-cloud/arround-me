@@ -540,6 +540,7 @@
       <input type="range" id="distSlider" min="500" max="20000" step="500" value="3000">
       <span class="dist-val mono" id="distVal">3 km</span>
     </div>
+    <div id="radiusHint" style="display:none;font-size:.76rem;color:var(--muted);margin:-8px 2px 14px;"></div>
 
     <button class="go-btn" id="searchBtn">
       <svg class="icon" viewBox="0 0 24 24" style="width:16px;height:16px;"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
@@ -747,6 +748,8 @@
     else root.setAttribute('data-theme', settings.theme);
   }
 
+  const TOUT_MAX_RADIUS = 5000; // querying every category at once is heavy; cap it
+
   // ---------- State ----------
   let state = {
     cat: "tout",
@@ -754,7 +757,9 @@
     dist: settings.defaultRadius,
     allResults: [],
     userPos: null,
-    cuisineFilter: ""
+    cuisineFilter: "",
+    fetchedCat: null,
+    fetchedRadius: null
   };
 
   const distSlider = document.getElementById('distSlider');
@@ -775,13 +780,25 @@
     return m >= 1000 ? (m/1000).toFixed(m % 1000 === 0 ? 0 : 1) + " km" : Math.round(m) + " m";
   }
 
+  const radiusHint = document.getElementById('radiusHint');
+  function updateRadiusHint(){
+    if(state.cat === 'tout' && state.dist > TOUT_MAX_RADIUS){
+      radiusHint.style.display = 'block';
+      radiusHint.textContent = `La catégorie "Tout" est limitée à ${fmtDist(TOUT_MAX_RADIUS)} pour rester rapide — choisis une catégorie précise pour chercher plus loin.`;
+    } else {
+      radiusHint.style.display = 'none';
+    }
+  }
+
   distSlider.value = state.dist;
   distVal.textContent = fmtDist(state.dist);
+  updateRadiusHint();
   distSlider.addEventListener('input', ()=>{
     state.dist = parseInt(distSlider.value,10);
     distVal.textContent = fmtDist(state.dist);
     settings.defaultRadius = state.dist;
     saveSettings();
+    updateRadiusHint();
   });
 
   function onKeyActivate(handler){
@@ -798,7 +815,16 @@
     chip.classList.add('active');
     state.cat = chip.dataset.cat;
     state.cuisineFilter = "";
-    if(state.allResults.length) render();
+    updateRadiusHint();
+
+    const haveBroadData = state.fetchedCat === 'tout' && state.fetchedRadius >= effectiveRadius(state.cat, state.dist);
+    const needsFreshFetch = state.userPos && state.fetchedCat && !haveBroadData && state.fetchedCat !== state.cat;
+
+    if(needsFreshFetch){
+      runSearch(state.userPos.lat, state.userPos.lon, state.cat);
+    } else if(state.allResults.length){
+      render();
+    }
   }
   catChipsEl.addEventListener('click', handleCatChip);
   catChipsEl.addEventListener('keydown', onKeyActivate(handleCatChip));
@@ -825,44 +851,64 @@
   const OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
     "https://overpass.openstreetmap.ru/api/interpreter"
   ];
 
-  async function fetchOverpass(query, onRetry){
-    let lastErr;
-    for(let i=0; i<OVERPASS_ENDPOINTS.length; i++){
-      const url = OVERPASS_ENDPOINTS[i];
-      const controller = new AbortController();
-      const timeoutId = setTimeout(()=>controller.abort(), 15000);
-      try{
-        if(i > 0 && onRetry) onRetry(i);
-        const resp = await fetch(url, {
-          method:"POST",
-          body:"data=" + encodeURIComponent(query),
-          signal: controller.signal
-        });
-        clearTimeout(timeoutId);
+  // Query every mirror at once and use whichever answers first — much faster
+  // and more resilient than trying them one after another.
+  async function fetchOverpass(query, onSlow){
+    const controllers = OVERPASS_ENDPOINTS.map(()=>new AbortController());
+    const slowTimer = setTimeout(()=>{ if(onSlow) onSlow(); }, 6000);
+    const hardTimer = setTimeout(()=>controllers.forEach(c=>c.abort()), 20000);
+
+    const attempts = OVERPASS_ENDPOINTS.map((url, i)=>
+      fetch(url, {
+        method:"POST",
+        body:"data=" + encodeURIComponent(query),
+        signal: controllers[i].signal
+      }).then(async resp=>{
         if(!resp.ok) throw new Error("http_" + resp.status);
-        const data = await resp.json();
-        return data;
-      }catch(err){
-        clearTimeout(timeoutId);
-        lastErr = err;
-      }
+        return await resp.json();
+      })
+    );
+
+    try{
+      const data = await Promise.any(attempts);
+      return data;
+    }catch(aggErr){
+      throw (aggErr && aggErr.errors && aggErr.errors[0]) || aggErr;
+    }finally{
+      clearTimeout(slowTimer);
+      clearTimeout(hardTimer);
+      controllers.forEach(c=>c.abort());
     }
-    throw lastErr || new Error("all_endpoints_failed");
   }
 
   function escapeRegex(s){ return s.replace(/[.*+?^${}()|[\]\\]/g,"\\$&"); }
 
-  function buildQuery(lat,lon,radius){
+  function effectiveRadius(cat, radius){
+    return cat === 'tout' ? Math.min(radius, TOUT_MAX_RADIUS) : radius;
+  }
+
+  function buildQuery(lat,lon,radius,cat){
+    const relevant = cat === 'tout' ? TAGS : TAGS.filter(t=>t[3] === cat);
     const byKey = {};
-    TAGS.forEach(([k,v])=>{ (byKey[k] = byKey[k] || []).push(escapeRegex(v)); });
+    relevant.forEach(([k,v])=>{ (byKey[k] = byKey[k] || []).push(escapeRegex(v)); });
     let parts = "";
     Object.entries(byKey).forEach(([k,values])=>{
       parts += `nwr["${k}"~"^(${values.join("|")})$"](around:${radius},${lat},${lon});`;
     });
-    return `[out:json][timeout:25];(${parts});out center tags;`;
+    // Capped output count keeps dense city centers from timing out the server.
+    return `[out:json][timeout:18];(${parts});out center tags 700;`;
+  }
+
+  // Short-lived in-memory cache so retries / repeat searches don't hammer
+  // the free Overpass service for data we already have.
+  const searchCache = new Map();
+  const CACHE_TTL_MS = 5 * 60 * 1000;
+  function cacheKey(lat,lon,radius,cat){
+    return `${lat.toFixed(3)}|${lon.toFixed(3)}|${radius}|${cat}`;
   }
 
   function addr(tags){
@@ -940,6 +986,79 @@
     return openResult;
   }
 
+  function buildItemsFromOverpassData(data, lat, lon){
+    const seen = new Set();
+    const items = [];
+    (data.elements||[]).forEach(el=>{
+      const tags = el.tags || {};
+      let match = null;
+      for(const [k,v] of TAGS){
+        if(tags[k] === v){ match = tagInfo(k,v); break; }
+      }
+      if(!match) return;
+      const elLat = el.lat || (el.center && el.center.lat);
+      const elLon = el.lon || (el.center && el.center.lon);
+      if(elLat == null || elLon == null) return;
+      const name = tags.name || match[2];
+      const dedupeKey = name + "|" + elLat.toFixed(4) + "|" + elLon.toFixed(4);
+      if(seen.has(dedupeKey)) return;
+      seen.add(dedupeKey);
+      const distance = haversine(lat,lon,elLat,elLon);
+      items.push({
+        name,
+        label: match[2],
+        category: match[3],
+        audiences: match[4],
+        lat: elLat, lon: elLon,
+        distance,
+        address: addr(tags),
+        opening: tags.opening_hours || "",
+        phone: tags.phone || tags["contact:phone"] || "",
+        website: tags.website || tags["contact:website"] || tags.url || "",
+        wheelchair: tags.wheelchair || "",
+        cuisine: tags.cuisine ? tags.cuisine.split(";").map(c=>c.trim().toLowerCase().replace(/_/g," ")).filter(Boolean) : []
+      });
+    });
+    items.sort((a,b)=>a.distance - b.distance);
+    return items;
+  }
+
+  async function runSearch(lat, lon, cat){
+    resultsZone.innerHTML = "";
+    searchBtn.disabled = true;
+    const radius = effectiveRadius(cat, state.dist);
+    statusZone.innerHTML = `<div class="status"><div class="spinner"></div>Recherche des lieux dans un rayon de ${fmtDist(radius)}…</div>`;
+
+    try{
+      const key = cacheKey(lat, lon, radius, cat);
+      const cached = searchCache.get(key);
+      let data;
+      if(cached && (Date.now() - cached.time) < CACHE_TTL_MS){
+        data = cached.data;
+      } else {
+        const query = buildQuery(lat,lon,radius,cat);
+        data = await fetchOverpass(query, ()=>{
+          statusZone.innerHTML = `<div class="status"><div class="spinner"></div>Ça prend un peu plus de temps que prévu, encore un instant…</div>`;
+        });
+        searchCache.set(key, { time: Date.now(), data });
+      }
+
+      state.allResults = buildItemsFromOverpassData(data, lat, lon);
+      state.fetchedCat = cat;
+      state.fetchedRadius = radius;
+      statusZone.innerHTML = "";
+      render();
+    }catch(err){
+      if(err && err.name === 'AbortError'){
+        showError("La recherche a pris trop de temps (zone très dense ou distance trop grande). Essaie de réduire la distance maximum.");
+      } else {
+        showError("Impossible de contacter le service de recherche de lieux. Vérifie ta connexion et réessaie.");
+      }
+    }finally{
+      searchBtn.disabled = false;
+    }
+  }
+
   async function doSearch(){
     statusZone.innerHTML = `<div class="status"><div class="spinner"></div>Localisation en cours…</div>`;
     resultsZone.innerHTML = "";
@@ -951,63 +1070,10 @@
       return;
     }
 
-    navigator.geolocation.getCurrentPosition(async (pos)=>{
+    navigator.geolocation.getCurrentPosition((pos)=>{
       const lat = pos.coords.latitude, lon = pos.coords.longitude;
       state.userPos = {lat,lon};
-      statusZone.innerHTML = `<div class="status"><div class="spinner"></div>Recherche des lieux dans un rayon de ${fmtDist(state.dist)}…</div>`;
-
-      try{
-        const query = buildQuery(lat,lon,state.dist);
-        const data = await fetchOverpass(query, ()=>{
-          statusZone.innerHTML = `<div class="status"><div class="spinner"></div>Serveur occupé, nouvelle tentative…</div>`;
-        });
-
-        const seen = new Set();
-        const items = [];
-        (data.elements||[]).forEach(el=>{
-          const tags = el.tags || {};
-          let match = null;
-          for(const [k,v] of TAGS){
-            if(tags[k] === v){ match = tagInfo(k,v); break; }
-          }
-          if(!match) return;
-          const elLat = el.lat || (el.center && el.center.lat);
-          const elLon = el.lon || (el.center && el.center.lon);
-          if(elLat == null || elLon == null) return;
-          const name = tags.name || match[2];
-          const key = name + "|" + elLat.toFixed(4) + "|" + elLon.toFixed(4);
-          if(seen.has(key)) return;
-          seen.add(key);
-          const distance = haversine(lat,lon,elLat,elLon);
-          items.push({
-            name,
-            label: match[2],
-            category: match[3],
-            audiences: match[4],
-            lat: elLat, lon: elLon,
-            distance,
-            address: addr(tags),
-            opening: tags.opening_hours || "",
-            phone: tags.phone || tags["contact:phone"] || "",
-            website: tags.website || tags["contact:website"] || tags.url || "",
-            wheelchair: tags.wheelchair || "",
-            cuisine: tags.cuisine ? tags.cuisine.split(";").map(c=>c.trim().toLowerCase().replace(/_/g," ")).filter(Boolean) : []
-          });
-        });
-
-        items.sort((a,b)=>a.distance - b.distance);
-        state.allResults = items;
-        statusZone.innerHTML = "";
-        render();
-      }catch(err){
-        if(err && err.name === 'AbortError'){
-          showError("La recherche a pris trop de temps (zone très dense ou distance trop grande). Essaie de réduire la distance maximum.");
-        } else {
-          showError("Impossible de contacter le service de recherche de lieux. Vérifie ta connexion et réessaie.");
-        }
-      }finally{
-        searchBtn.disabled = false;
-      }
+      runSearch(lat, lon, state.cat);
     }, (err)=>{
       searchBtn.disabled = false;
       let msg = "Impossible d'obtenir ta position.";
