@@ -458,7 +458,7 @@
     </button>
   </div>
   <div class="title-block">
-    <h1>Yopi 2.1</h1>
+    <h1>Yopi 2.2</h1>
     <p>Snacks, restos, activités, shopping, bien-être, culture, nature, hébergement et services près de toi.</p>
   </div>
 </header>
@@ -848,67 +848,30 @@
     return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
   }
 
-  const OVERPASS_ENDPOINTS = [
-    "https://overpass-api.de/api/interpreter",
-    "https://overpass.kumi.systems/api/interpreter",
-    "https://overpass.private.coffee/api/interpreter",
-    "https://overpass.openstreetmap.ru/api/interpreter"
-  ];
-
-  // Query every mirror at once and use whichever answers first — much faster
-  // and more resilient than trying them one after another.
-  async function fetchOverpass(query, onSlow){
-    const controllers = OVERPASS_ENDPOINTS.map(()=>new AbortController());
-    const slowTimer = setTimeout(()=>{ if(onSlow) onSlow(); }, 6000);
-    const hardTimer = setTimeout(()=>controllers.forEach(c=>c.abort()), 20000);
-
-    const attempts = OVERPASS_ENDPOINTS.map((url, i)=>
-      fetch(url, {
-        method:"POST",
-        body:"data=" + encodeURIComponent(query),
-        signal: controllers[i].signal
-      }).then(async resp=>{
-        if(!resp.ok) throw new Error("http_" + resp.status);
-        return await resp.json();
-      })
-    );
-
-    try{
-      const data = await Promise.any(attempts);
-      return data;
-    }catch(aggErr){
-      throw (aggErr && aggErr.errors && aggErr.errors[0]) || aggErr;
-    }finally{
-      clearTimeout(slowTimer);
-      clearTimeout(hardTimer);
-      controllers.forEach(c=>c.abort());
-    }
-  }
-
-  function escapeRegex(s){ return s.replace(/[.*+?^${}()|[\]\\]/g,"\\$&"); }
-
+  // The actual Overpass querying now happens server-side in /api/places —
+  // this keeps CORS/mirror/retry complexity out of the client and lets many
+  // visitors share one cached result per area instead of each hammering
+  // Overpass individually.
   function effectiveRadius(cat, radius){
     return cat === 'tout' ? Math.min(radius, TOUT_MAX_RADIUS) : radius;
   }
 
-  function buildQuery(lat,lon,radius,cat){
-    const relevant = cat === 'tout' ? TAGS : TAGS.filter(t=>t[3] === cat);
-    const byKey = {};
-    relevant.forEach(([k,v])=>{ (byKey[k] = byKey[k] || []).push(escapeRegex(v)); });
-    let parts = "";
-    Object.entries(byKey).forEach(([k,values])=>{
-      parts += `nwr["${k}"~"^(${values.join("|")})$"](around:${radius},${lat},${lon});`;
-    });
-    // Capped output count keeps dense city centers from timing out the server.
-    return `[out:json][timeout:18];(${parts});out center tags 700;`;
-  }
-
-  // Short-lived in-memory cache so retries / repeat searches don't hammer
-  // the free Overpass service for data we already have.
-  const searchCache = new Map();
-  const CACHE_TTL_MS = 5 * 60 * 1000;
-  function cacheKey(lat,lon,radius,cat){
-    return `${lat.toFixed(3)}|${lon.toFixed(3)}|${radius}|${cat}`;
+  async function fetchPlaces(lat, lon, radius, cat, onSlow){
+    const slowTimer = setTimeout(()=>{ if(onSlow) onSlow(); }, 6000);
+    const controller = new AbortController();
+    const hardTimer = setTimeout(()=>controller.abort(), 20000);
+    try{
+      const url = `/api/places?lat=${lat.toFixed(3)}&lon=${lon.toFixed(3)}&radius=${Math.round(radius)}&cat=${encodeURIComponent(cat)}`;
+      const resp = await fetch(url, { signal: controller.signal });
+      if(!resp.ok){
+        const body = await resp.json().catch(()=>({}));
+        throw new Error(body.error || ("http_" + resp.status));
+      }
+      return await resp.json();
+    }finally{
+      clearTimeout(slowTimer);
+      clearTimeout(hardTimer);
+    }
   }
 
   function addr(tags){
@@ -1030,18 +993,9 @@
     statusZone.innerHTML = `<div class="status"><div class="spinner"></div>Recherche des lieux dans un rayon de ${fmtDist(radius)}…</div>`;
 
     try{
-      const key = cacheKey(lat, lon, radius, cat);
-      const cached = searchCache.get(key);
-      let data;
-      if(cached && (Date.now() - cached.time) < CACHE_TTL_MS){
-        data = cached.data;
-      } else {
-        const query = buildQuery(lat,lon,radius,cat);
-        data = await fetchOverpass(query, ()=>{
-          statusZone.innerHTML = `<div class="status"><div class="spinner"></div>Ça prend un peu plus de temps que prévu, encore un instant…</div>`;
-        });
-        searchCache.set(key, { time: Date.now(), data });
-      }
+      const data = await fetchPlaces(lat, lon, radius, cat, ()=>{
+        statusZone.innerHTML = `<div class="status"><div class="spinner"></div>Ça prend un peu plus de temps que prévu, encore un instant…</div>`;
+      });
 
       state.allResults = buildItemsFromOverpassData(data, lat, lon);
       state.fetchedCat = cat;

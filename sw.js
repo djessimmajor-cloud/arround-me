@@ -20,8 +20,10 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
 
-  // Never cache API calls (Overpass) or cross-origin requests — always go to network.
+  // Never cache API calls or cross-origin requests — always go straight to
+  // the network so /api/places respects its own Cache-Control freshness window.
   if (url.origin !== self.location.origin) return;
+  if (url.pathname.startsWith("/api/")) return;
 
   // The app shell (HTML / navigations) must always be checked against the
   // network first so deploys show up immediately. Cache is only a fallback
