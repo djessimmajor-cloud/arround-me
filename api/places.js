@@ -79,7 +79,8 @@ const VALID_CATS = new Set(["tout", ...new Set(TAGS.map(t => t[3]))]);
 const TOUT_MAX_RADIUS = 5000;
 const OVERPASS_ENDPOINTS = [
   "https://overpass-api.de/api/interpreter",
-  "https://overpass.kumi.systems/api/interpreter"
+  "https://overpass.kumi.systems/api/interpreter",
+  "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
 ];
 
 function escapeRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
@@ -97,12 +98,16 @@ function buildQuery(lat, lon, radius, cat) {
 
 // Warm in-memory cache. Persists across requests as long as the serverless
 // instance stays warm — not a guarantee, but a big win when it hits.
+// Two freshness tiers: FRESH is served instantly with no network call at all.
+// STALE is kept around much longer purely as an emergency fallback — if every
+// mirror fails, we'd rather answer with slightly-old data than show an error.
 const cache = new Map();
-const CACHE_TTL_MS = 10 * 60 * 1000;
+const FRESH_TTL_MS = 20 * 60 * 1000;
+const STALE_TTL_MS = 12 * 60 * 60 * 1000;
 
 async function fetchFromMirrors(query) {
   const controllers = OVERPASS_ENDPOINTS.map(() => new AbortController());
-  const hardTimer = setTimeout(() => controllers.forEach(c => c.abort()), 8500);
+  const hardTimer = setTimeout(() => controllers.forEach(c => c.abort()), 12000);
   try {
     const attempts = OVERPASS_ENDPOINTS.map((url, i) =>
       fetch(url, {
@@ -147,7 +152,9 @@ module.exports = async function handler(req, res) {
   const key = `${rlat}|${rlon}|${effRadius}|${cat}`;
 
   const cached = cache.get(key);
-  if (cached && (Date.now() - cached.time) < CACHE_TTL_MS) {
+  const cacheAge = cached ? Date.now() - cached.time : Infinity;
+
+  if (cached && cacheAge < FRESH_TTL_MS) {
     res.setHeader("Cache-Control", "public, max-age=60, s-maxage=300, stale-while-revalidate=600");
     res.status(200).json(cached.data);
     return;
@@ -160,6 +167,14 @@ module.exports = async function handler(req, res) {
     res.setHeader("Cache-Control", "public, max-age=60, s-maxage=300, stale-while-revalidate=600");
     res.status(200).json(data);
   } catch (err) {
+    // Every mirror failed. If we have anything at all for this spot — even
+    // hours old — serve that instead of an error page. Stale beats broken.
+    if (cached && cacheAge < STALE_TTL_MS) {
+      res.setHeader("Cache-Control", "public, max-age=30");
+      res.setHeader("X-Yopi-Stale", "true");
+      res.status(200).json(cached.data);
+      return;
+    }
     res.status(502).json({ error: "overpass_unavailable", detail: String(err && err.message || err) });
   }
 }

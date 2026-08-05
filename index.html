@@ -458,7 +458,7 @@
     </button>
   </div>
   <div class="title-block">
-    <h1>Yopi 2.2</h1>
+    <h1>Yopi 2.3</h1>
     <p>Snacks, restos, activités, shopping, bien-être, culture, nature, hébergement et services près de toi.</p>
   </div>
 </header>
@@ -859,7 +859,7 @@
   async function fetchPlaces(lat, lon, radius, cat, onSlow){
     const slowTimer = setTimeout(()=>{ if(onSlow) onSlow(); }, 6000);
     const controller = new AbortController();
-    const hardTimer = setTimeout(()=>controller.abort(), 20000);
+    const hardTimer = setTimeout(()=>controller.abort(), 17000);
     try{
       const url = `/api/places?lat=${lat.toFixed(3)}&lon=${lon.toFixed(3)}&radius=${Math.round(radius)}&cat=${encodeURIComponent(cat)}`;
       const resp = await fetch(url, { signal: controller.signal });
